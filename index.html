@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,user-scalable=no">
+<title>Flipper Zero — Multi-Protocol Signal Command Center</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e17;color:#e0e0e0;font-family:.SF Mono,monospace;overflow:hidden;height:100vh;display:flex;flex-direction:column}
+#hdr{display:flex;align-items:center;justify-content:space-between;padding:6px 12px;background:#0d1117;border-bottom:1px solid #1e3a5f;font-size:13px;flex-shrink:0;z-index:10;position:relative}
+#hdr h1{font-size:14px;color:#00e5ff;letter-spacing:1px;text-shadow:0 0 8px #00e5ff44}
+#tabs{display:flex;gap:4px}
+.tab{padding:4px 10px;border:1px solid #1e3a5f;background:transparent;color:#7dd3fc;border-radius:4px;cursor:pointer;font:12px monospace;transition:all .15s}
+.tab.on{background:#1e3a5f;color:#fff;border-color:#00e5ff;box-shadow:0 0 6px #00e5ff44}
+.tab:hover{background:#1e3a5f}
+#stats{display:flex;gap:10px;font-size:10px;color:#64748b}
+#stats span{color:#00e5ff}
+#wrap{flex:1;position:relative;overflow:hidden}
+canvas{display:block;width:100%;height:100%}
+#log{height:36px;overflow-y:auto;background:#070b12;border-top:1px solid #1e3a5f;padding:2px 12px;font-size:10px;color:#64748b;flex-shrink:0}
+#log div{white-space:nowrap}
+#log .t{color:#3b82f6}
+#log .s{color:#22c55e}
+#log .w{color:#f59e0b}
+#log .e{color:#ef4444}
+</style>
+</head>
+<body>
+<div id="hdr">
+<h1>⚡ FLIPPER SIGNAL COMMAND</h1>
+<div id="tabs">
+<button class="tab on" data-m="radar">Radar</button>
+<button class="tab" data-m="pipeline">Pipeline</button>
+<button class="tab" data-m="matrix">Matrix</button>
+<button class="tab" data-m="attack">Attack</button>
+</div>
+<div id="stats"></div>
+</div>
+<div id="wrap"><canvas id="c"></canvas></div>
+<div id="log"></div>
+<script>
+// --- Seeded PRNG ---
+class PRNG{constructor(s){this.s=s}next(){this.s=(this.s*1664525+1013904223)>>>0;return this.s/4294967296}
+range(a,b){return a+this.next()*(b-a)}int(a,b){return Math.floor(this.range(a,b+1))}}
+const rng=new PRNG(42);
+
+// --- Globals ---
+const cv=document.getElementById('c'),cx=cv.getContext('2d');
+let W,H,dpr,mode='radar',mx=-1,my=-1,tick=0;
+const PROTO=['Sub-GHz','NFC','RFID','IR','BLE'];
+const PCOL={'Sub-GHz':'#f97316',NFC:'#22c55e',RFID:'#3b82f6',IR:'#a855f7',BLE:'#06b6d4'};
+const SIGS=[
+{name:'WiFi AP',freq:2.4,type:'Sub-GHz',str:-62},
+{name:'Garage Door',freq:433,type:'Sub-GHz',str:-45},
+{name:'Car Key Fob',freq:315,type:'Sub-GHz',str:-55},
+{name:'Weather Station',freq:868,type:'Sub-GHz',str:-70},
+{name:'AirTag',freq:13.56,type:'NFC',str:-50},
+{name:'Mifare Card',freq:13.56,type:'NFC',str:-48},
+{name:'EM-4100 RFID',freq:125e3,type:'RFID',str:-40},
+{name:'RC Switch',freq:433,type:'Sub-GHz',str:-60},
+{name:'AC Control',freq:38,type:'IR',str:-35},
+{name:'TV Remote',freq:38,type:'IR',str:-42},
+{name:'BLE Beacon',freq:2.4,type:'BLE',str:-65},
+{name:'Smart Lock',freq:2.4,type:'BLE',str:-58}
+];
+const DEVICES=[
+{name:'Tesla Model 3',proto:['Sub-GHz','BLE'],icon:'🚗',risk:9},
+{name:'Garage Door Pro',proto:['Sub-GHz'],icon:'🏠',risk:6},
+{name:'Sony Bravia TV',proto:['IR','BLE'],icon:'📺',risk:4},
+{name:'AirTag Proximity',proto:['BLE','NFC'],icon:'📍',risk:7},
+{name:'BMW Key Fob',proto:['Sub-GHz','BLE'],icon:'🔑',risk:8},
+{name:'NFC Wallet',proto:['NFC'],icon:'💳',risk:3},
+{name:'AC Unit',proto:['IR','Sub-GHz'],icon:'❄️',risk:5},
+{name:'RFID Badge',proto:['RFID','NFC'],icon:'🪪',risk:2},
+{name:'Smart Lock V2',proto:['BLE','Sub-GHz'],icon:'🔒',risk:9},
+{name:'Powerwall',proto:['Sub-GHz','BLE'],icon:'🔋',risk:6}
+];
+const ATTACKS=[
+{name:'Replay Attack',stages:['Capture','Decode','Store','Replay'],icon:'🔄',risk:8},
+{name:'Man-in-Middle',stages:['Listen','Modify','Inject','Forward'],icon:'🎭',risk:9},
+{name:'NFC Cloning',stages:['Read','Buffer','Write','Emulate'],icon:'📋',risk:7},
+{name:'BLE Sniff',stages:['Scan','Sync','Decode','Replay'],icon:'📡',risk:6}
+];
+
+// --- Resize ---
+function resize(){
+dpr=Math.min(window.devicePixelRatio||1,2);
+const r=document.getElementById('wrap').getBoundingClientRect();
+W=r.width;H=r.height;cv.width=W*dpr;cv.height=H*dpr;cv.style.width=W+'px';cv.style.height=H+'px';
+cx.setTransform(dpr,0,0,dpr,0,0);
+}
+window.addEventListener('resize',resize);resize();
+
+// --- Particles ---
+class Part{constructor(x,y,vx,vy,color,life,sz){this.x=x;this.y=y;this.vx=vx;this.vy=vy;this.color=color;this.life=life;this.ml=life;this.sz=sz||2}}
+let parts=[];
+function emit(x,y,n,col,spd){for(let i=0;i<n;i++){const a=rng.next()*Math.PI*2,s=rng.next()*spd;parts.push(new Part(x,y,Math.cos(a)*s,Math.sin(a)*s,col,rng.range(20,60),rng.range(1,3)))}}
+function updParts(){for(let i=parts.length-1;i>=0;i--){const p=parts[i];p.x+=p.vx;p.y+=p.vy;p.vx*=.98;p.vy*=.98;p.life--;if(p.life<=0)parts.splice(i,1)}}
+function drawParts(){for(const p of parts){cx.globalAlpha=p.life/p.ml*.7;cx.fillStyle=p.color;cx.beginPath();cx.arc(p.x,p.y,p.sz,0,Math.PI*2);cx.fill()}cx.globalAlpha=1}
+
+// --- Mode: Radar ---
+let radarAngle=0,radarBlips=[];
+function radarInit(){radarBlips=[];for(const s of SIGS)radarBlips.push({name:s.name,freq:s.freq,str:s.str,a:rng.next()*Math.PI*2,r:30+rng.next()*80,decay:0})}
+function drawRadar(){
+const cx0=W/2,cy0=H/2-20,R=Math.min(W,H)*.32;
+// Background rings
+cx.strokeStyle='#1e3a5f';cx.lineWidth=1;
+for(let r=1;r<=4;r++){cx.beginPath();cx.arc(cx0,cy0,R*r/4,0,Math.PI*2);cx.stroke()}
+// Crosshair
+cx.strokeStyle='#1e3a5f44';cx.beginPath();cx.moveTo(cx0-R,cy0);cx.lineTo(cx0+R,cy0);cx.moveTo(cx0,cy0-R);cx.lineTo(cx0,cy0+R);cx.stroke();
+// Sweep sector
+radarAngle+=.02;
+const grad=cx.createConicGradient(radarAngle,cx0,cy0);
+grad.addColorStop(0,'#00e5ff00');grad.addColorStop(.9,'#00e5ff00');grad.addColorStop(1,'#00e5ff18');
+cx.fillStyle=grad;cx.beginPath();cx.arc(cx0,cy0,R,0,Math.PI*2);cx.fill();
+// Sweep line
+cx.strokeStyle='#00e5ff88';cx.lineWidth=2;cx.beginPath();cx.moveTo(cx0,cy0);
+cx.lineTo(cx0+Math.cos(radarAngle)*R,cy0+Math.sin(radarAngle)*R);cx.stroke();
+// Glow at sweep tip
+cx.fillStyle='#00e5ff22';cx.beginPath();cx.arc(cx0+Math.cos(radarAngle)*R,cy0+Math.sin(radarAngle)*R,8,0,Math.PI*2);cx.fill();
+// Blips
+cx.fillStyle='#fff';cx.font='10px monospace';
+for(const b of radarBlips){
+b.a+=.0005;
+const bx=cx0+Math.cos(b.a)*b.r,by=cy0+Math.sin(b.a)*b.r;
+// Check if sweep passed recently
+const diff=((radarAngle%6.283)-b.a+6.283)%6.283;
+if(diff<.3&&b.decay===0){b.decay=.3}
+const alpha=b.decay>0?Math.max(0,1-b.decay/.3):.8;
+cx.globalAlpha=alpha;
+cx.fillStyle='#00e5ff';cx.beginPath();cx.arc(bx,by,4,0,Math.PI*2);cx.fill();
+cx.fillStyle=b.decay>0?'#ffaa00':'#22c55e';cx.beginPath();cx.arc(bx,by,1.5,0,Math.PI*2);cx.fill();
+if(b.decay>0){b.decay+=.003}
+cx.globalAlpha=1;
+cx.fillStyle=b.decay>0?'#f59e0b':'#94a3b8';cx.font='9px monospace';
+cx.fillText(b.name,bx+8,by-2);
+cx.fillStyle=b.decay>0?'#fbbf24':'#64748b';cx.font='8px monospace';
+cx.fillText(b.freq+' '+Math.abs(b.str)+'dBm',bx+8,by+8);
+}}
+
+// --- Mode: Pipeline ---
+let pipeFlow=0;
+function drawPipeline(){
+const stages=PROTO;
+const n=stages.length;
+const pad=80;const sw=(W-2*pad)/(n+1);
+// Pipeline connectors
+for(let i=0;i<n-1;i++){
+const x1=pad+sw*(i+1)+sw*.3,x2=pad+sw*(i+2)-sw*.3;
+const y=H/2;
+cx.strokeStyle='#1e3a5f';cx.lineWidth=4;cx.beginPath();cx.moveTo(x1,y);cx.lineTo(x2,y);cx.stroke();
+// Flow particles
+for(let j=0;j<3;j++){
+const t=((pipeFlow+j*.33+i*.2)%1);
+const px=x1+(x2-x1)*t;
+cx.fillStyle=PCOL[stages[i]];cx.globalAlpha=.8;
+cx.beginPath();cx.arc(px,y,3,0,Math.PI*2);cx.fill();cx.globalAlpha=1;
+}}
+// Stage nodes
+for(let i=0;i<n;i++){
+const x=pad+sw*(i+1);const y=H/2;
+const r=40;
+const col=PCOL[stages[i]];
+// Glow
+cx.fillStyle=col+'22';cx.beginPath();cx.arc(x,y,r+10,0,Math.PI*2);cx.fill();
+// Node
+cx.fillStyle='#0d1117';cx.strokeStyle=col;cx.lineWidth=2;
+cx.beginPath();cx.arc(x,y,r,0,Math.PI*2);cx.fill();cx.stroke();
+cx.fillStyle=col;cx.font='bold 11px monospace';cx.textAlign='center';
+cx.fillText(stages[i],x,y+4);
+cx.fillStyle='#64748b';cx.font='9px monospace';
+cx.fillText(rng.range(100,999)+' pkts/s',x,y+18);
+// Data particles orbiting
+for(let j=0;j<5;j++){
+const a=tick*.02+j*Math.PI*2/5+i;
+const ox=x+Math.cos(a)*(r+15);
+const oy=y+Math.sin(a)*(r+15);
+cx.fillStyle=col;cx.globalAlpha=.4;cx.beginPath();cx.arc(ox,oy,1.5,0,Math.PI*2);cx.fill();cx.globalAlpha=1;
+}
+}cx.textAlign='start';
+// Signal strength bars at bottom
+const barY=H-pad+30;cx.font='10px monospace';
+for(let i=0;i<n;i++){
+const x=pad+sw*(i+1);
+const val=rng.range(30,95);
+cx.fillStyle='#1e3a5f';cx.fillRect(x-30,barY,60,val*.5);
+cx.fillStyle=PCOL[stages[i]];cx.fillRect(x-30,barY,60*val/100,val*.5);
+cx.fillStyle='#94a3b8';cx.textAlign='center';cx.fillText(stages[i],x,barY-5);
+}cx.textAlign='start';
+}
+
+// --- Mode: Matrix ---
+let matHover=-1;
+function drawMatrix(){
+const cols=5;const rows=2;
+const cw=(W-60)/cols;const ch=(H-40)/rows;
+for(let i=0;i<DEVICES.length;i++){
+const col=i%cols;const row=Math.floor(i/cols);
+const x=30+col*cw;const y=20+row*ch;
+const d=DEVICES[i];
+const isH=matHover===i;
+if(isH){cx.fillStyle='#00e5ff11';cx.strokeStyle='#00e5ff';cx.lineWidth=2}
+else{cx.fillStyle='#0d111733';cx.strokeStyle='#1e3a5f';cx.lineWidth=1}
+cx.fillRect(x+2,y+2,cw-4,ch-4);cx.strokeRect(x+2,y+2,cw-4,ch-4);
+cx.font='20px serif';cx.fillText(d.icon,x+12,y+32);
+cx.fillStyle='#e0e0e0';cx.font='bold 11px monospace';cx.fillText(d.name,x+42,y+28);
+// Proto badges
+cx.font='8px monospace';
+for(let p=0;p<d.proto.length;p++){
+const bx=x+12+p*60;const by=y+ch-30;
+cx.fillStyle=PCOL[d.proto[p]]+'44';cx.strokeStyle=PCOL[d.proto[p]];cx.lineWidth=1;
+cx.fillRect(bx,by,55,14);cx.strokeRect(bx,by,55,14);
+cx.fillStyle=PCOL[d.proto[p]];cx.fillText(d.proto[p],bx+4,by+11);
+}
+// Risk meter
+const rx=x+cw-50;const ry=y+ch-55;
+cx.fillStyle='#1e3a5f';cx.fillRect(rx,ry,36,6);
+cx.fillStyle=d.risk>=7?'#ef4444':d.risk>=5?'#f59e0b':'#22c55e';cx.fillRect(rx,ry,36*d.risk/10,6);
+cx.fillStyle='#64748b';cx.font='7px monospace';cx.textAlign='right';cx.fillText('RISK',rx+36,ry-2);
+cx.textAlign='start';
+}}
+
+// --- Mode: Attack ---
+let atkFlow=0;
+function drawAttack(){
+const n=ATTACKS.length;
+const cols2=2;const rows2=2;
+const cw2=(W-40)/cols2;const ch2=(H-60)/rows2;
+for(let i=0;i<n;i++){
+const col2=i%cols2;const row2=Math.floor(i/rows2);
+const ax=20+col2*cw2;const ay=30+row2*ch2;
+const atk=ATTACKS[i];
+// Title
+cx.fillStyle='#e0e0e0';cx.font='bold 12px monospace';cx.fillText(atk.icon+' '+atk.name,ax+10,ay+22);
+cx.fillStyle='#64748b';cx.font='10px monospace';
+cx.fillText('Risk: '+atk.risk+'/10',ax+10,ay+38);
+// Attack chain nodes
+const nc=atk.stages.length;
+const ny=ay+55;const ns=cw2-40;
+for(let s=0;s<nc;s++){
+const sx=ax+20+(ns/nc)*(s+.5);const sy=ny+40;
+const active=s<=Math.floor(atkFlow*nc)%Math.max(nc,1);
+cx.fillStyle=active?'#00e5ff22':'#1e3a5f33';
+cx.strokeStyle=active?'#00e5ff':'#1e3a5f';cx.lineWidth=1;
+cx.beginPath();cx.arc(sx,sy,20,0,Math.PI*2);cx.fill();cx.stroke();
+cx.fillStyle=active?'#fff':'#94a3b8';cx.font='8px monospace';cx.textAlign='center';
+cx.fillText(atk.stages[s],sx,sy+3);cx.textAlign='start';
+// Connector
+if(s<nc-1){
+cx.strokeStyle=active?'#00e5ff44':'#1e3a5f22';cx.lineWidth=2;
+cx.beginPath();cx.moveTo(sx+20,sy);cx.lineTo(sx+ns/nc-20,sy);cx.stroke();
+// Flow dot
+const ft=((atkFlow*2+s*.5)%1);
+const dotx=sx+20+(ns/nc-40)*ft;
+cx.fillStyle='#00e5ff';cx.globalAlpha=.8;cx.beginPath();cx.arc(dotx,sy,2,0,Math.PI*2);cx.fill();cx.globalAlpha=1;
+}}
+// Signal waveform at bottom
+const wy=ay+ch2-30;
+cx.strokeStyle=PCOL[PROTO[i%PROTO.length]]+'44';cx.lineWidth=1;cx.beginPath();
+for(let px=0;px<cw2-40;px+=2){
+const wave=Math.sin(px*.1+atkFlow*3+i)*8;
+if(px===0)cx.moveTo(ax+20+px,wy+wave);else cx.lineTo(ax+20+px,wy+wave);
+}cx.stroke();
+}
+atkFlow+=.01;
+}
+
+// --- Event log ---
+const logEl=document.getElementById('log');
+const logMsgs=['Sub-GHz 433MHz scan complete','NFC tag detected','BLE beacon ping received','IR code decoded','RFID card read','Garage door replayed','AC command sent','TV power toggle'];
+function addLog(msg,type){
+const t=new Date().toLocaleTimeString();
+logEl.innerHTML+=`<div><span class="t">[${t}]</span> <span class="${type}">${msg}</span></div>`;
+if(logEl.children.length>20)logEl.removeChild(logEl.firstChild);
+}
+setInterval(()=>addLog(logEl.children.length>0?logEl.lastElementChild.textContent:''),3000);
+
+// --- Stats HUD ---
+function updateStats(){
+const el=document.getElementById('stats');
+el.innerHTML=`<div>Signals: <span>${SIGS.length}</span></div><div>Devices: <span>${DEVICES.length}</span></div><div>Attack Vectors: <span>${ATTACKS.length}</span></div><div>Packets/s: <span>${rng.range(200,800)}</span></div>`;
+}
+
+// --- Mode switch ---
+document.querySelectorAll('.tab').forEach(b=>{
+b.addEventListener('click',()=>{
+document.querySelectorAll('.tab').forEach(t=>t.classList.remove('on'));
+b.classList.add('on');mode=b.dataset.m;
+parts=[];
+if(mode==='radar'){radarInit();addLog('Mode: Signal Radar','s')}
+else if(mode==='pipeline'){addLog('Mode: Protocol Pipeline','s')}
+else if(mode==='matrix'){addLog('Mode: Device Matrix','s')}
+else if(mode==='attack'){atkFlow=0;addLog('Mode: Attack Chain','s')}
+})});
+
+// --- Touch ---
+let touchStartX=0;
+cv.addEventListener('touchstart',e=>{touchStartX=e.touches[0].clientX;e.preventDefault()},{passive:false});
+cv.addEventListener('touchend',e=>{
+const dx=e.changedTouches[0].clientX-touchStartX;
+if(Math.abs(dx)>50){
+const modes=['radar','pipeline','matrix','attack'];
+const ci=modes.indexOf(mode);
+const ni=(ci+(dx>0?1:-1)+4)%4;
+mode=modes[ni];
+document.querySelectorAll('.tab').forEach(t=>t.classList.remove('on'));
+document.querySelector(`[data-m="${mode}"]`).classList.add('on');
+parts=[];
+if(mode==='radar'){radarInit()}
+addLog('Swiped to: '+mode.charAt(0).toUpperCase()+mode.slice(1)','w');
+}e.preventDefault();
+},{passive:false});
+
+// --- Mouse hover ---
+cv.addEventListener('mousemove',e=>{
+const r=cv.getBoundingClientRect();mx=e.clientX-r.left;my=e.clientY-r.top;
+if(mode==='matrix'){matHover=-1;for(let i=0;i<DEVICES.length;i++){const col=i%5;const row=Math.floor(i/5);
+const x=30+col*(W-60)/5;const y=20+row*(H-40)/5;
+if(mx>=x&&mx<=x+(W-60)/5&&my>=y&&my<=y+(H-40)/5)matHover=i;}}}
+);
+
+// --- Main Loop ---
+function loop(){
+tick++;cx.clearRect(0,0,W,H);
+// Grid bg
+cx.strokeStyle='#0d1117';cx.lineWidth=.5;
+for(let x=0;x<W;x+=40){cx.beginPath();cx.moveTo(x,0);cx.lineTo(x,H);cx.stroke()}
+for(let y=0;y<H;y+=40){cx.beginPath();cx.moveTo(0,y);cx.lineTo(W,y);cx.stroke()}
+// Ambient particles
+if(parts.length<30){const a=rng.next()*Math.PI*2;parts.push(new Part(rng.range(0,W),H,rng.range(-.3,.3),rng.range(-1,-.3),rng.next()>.5?'#00e5ff22':'#1e3a5f11',rng.range(100,300),rng.range(1,2)))}
+updParts();drawParts();
+if(mode==='radar')drawRadar();
+else if(mode==='pipeline'){drawPipeline();pipeFlow+=.005}
+else if(mode==='matrix')drawMatrix();
+else if(mode==='attack')drawAttack();
+updateStats();
+requestAnimationFrame(loop);
+}
+radarInit();
+// Initial logs
+addLog('Flipper Signal Command initialized','s');
+addLog('Scanning Sub-GHz band (315-928 MHz)','w');
+addLog('Loading device database...','t');
+addLog('Ready.','s');
+loop();
+</script>
+</body>
+</html>
